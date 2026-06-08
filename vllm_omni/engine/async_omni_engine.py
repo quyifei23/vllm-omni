@@ -97,6 +97,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Imported for class-level ACK pipe storage (see _determine_stage_plans).
+from vllm_omni.distributed.omni_connectors.connectors.uniipc_connector import \
+    UniIPCConnector
+
 _STARTUP_POLL_INTERVAL_S = 1.0
 
 
@@ -295,6 +299,7 @@ class AsyncOmniEngine:
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
+        self._gpu_tensor_transport: str = kwargs.get("gpu_tensor_transport", "none")
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[Any] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -460,6 +465,35 @@ class AsyncOmniEngine:
         prompt_expand_func = None
         stage_plans: list[LogicalStageInitPlan] = []
 
+        # Initialize GPU transport ACK channels for edges that use GPU transport.
+        # Scan connector extras AND honour the --gpu-tensor-transport CLI flag
+        # so that a CLI-only override also gets ACK pipes wired.
+        _ack_conns: dict[tuple[str, str], Any] = {}
+        _consumer_ack_conns: dict[tuple[str, str], Any] = {}
+        _cli_gpu_mode = self._gpu_tensor_transport if self._gpu_tensor_transport != "none" else None
+        if omni_transfer_config is not None:
+            try:
+                from vllm_omni.distributed.gpu_transport.control_channel import ControlChannelPair
+
+                for edge_key, connector_spec in getattr(
+                    omni_transfer_config, 'connectors', {}
+                ).items():
+                    extra = getattr(connector_spec, 'extra', {}) or {}
+                    gpu_mode = _cli_gpu_mode or extra.get('gpu_transport_mode', 'none')
+                    if gpu_mode in ('cuda_ipc', 'cuda_copy'):
+                        chan = ControlChannelPair()
+                        _ack_conns[edge_key] = chan.producer_conn
+                        _consumer_ack_conns[edge_key] = chan.consumer_conn
+                        logger.debug(
+                            "[Orchestrator] Created ACK channel for edge %s->%s (%s)",
+                            edge_key[0], edge_key[1], gpu_mode,
+                        )
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] Failed to create GPU transport ACK channels",
+                    exc_info=True,
+                )
+
         for stage_idx, stage_cfg in enumerate(self.stage_configs):
             base_metadata = extract_stage_metadata(stage_cfg)
             configured_stage_id = base_metadata.stage_id
@@ -471,6 +505,42 @@ class AsyncOmniEngine:
                 stage_id=configured_stage_id,
                 async_chunk=self.async_chunk,
             )
+            # Ensure stage_id is in extra so downstream connector creation
+            # can look up ACK pipes by stage identity.
+            if stage_connector_spec:
+                stage_connector_spec.setdefault("extra", {})["stage_id"] = configured_stage_id
+
+            # Inject GPU transport ACK pipe ends into connector spec
+            if stage_connector_spec and _ack_conns:
+                stage_id_str = str(configured_stage_id)
+                extra = stage_connector_spec.setdefault("extra", {})
+
+                # Find incoming edge (this stage is consumer, needs consumer_ack_conn)
+                for (from_s, to_s), conn in _consumer_ack_conns.items():
+                    if to_s == stage_id_str:
+                        extra["consumer_ack_conn"] = conn
+                        break
+
+                # Find outgoing edge (this stage is producer, needs ack_conn)
+                for (from_s, to_s), conn in _ack_conns.items():
+                    if from_s == stage_id_str:
+                        extra["ack_conn"] = conn
+                        break
+            # Override GPU transport mode from CLI when --gpu-tensor-transport
+            # is explicitly set (default "none" = no override).
+            if self._gpu_tensor_transport != "none" and stage_connector_spec:
+                extra = stage_connector_spec.setdefault("extra", {})
+                extra["gpu_transport_mode"] = self._gpu_tensor_transport
+            # Strip multiprocessing.Connection objects from extra before
+            # they enter vLLM's config hash computation.  Workers are
+            # forked so a module-level dict can bridge the gap.
+            if stage_connector_spec:
+                extra = stage_connector_spec.get("extra", {})
+                saved = {
+                    "ack_conn": extra.pop("ack_conn", None),
+                    "consumer_ack_conn": extra.pop("consumer_ack_conn", None),
+                }
+                UniIPCConnector._stage_ack_pipes[configured_stage_id] = saved
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = "local"
@@ -679,10 +749,15 @@ class AsyncOmniEngine:
                                     )
                                 )
                             else:
+                                stage_ack = UniIPCConnector._stage_ack_pipes.get(
+                                    plan.metadata.stage_id, {}
+                                )
+                                stage_ack["stage_id"] = plan.metadata.stage_id
                                 addresses, proc, handshake_address = spawn_stage_core(
                                     vllm_config=vllm_config,
                                     executor_class=executor_class,
                                     log_stats=True,
+                                    ack_pipes=stage_ack if any(stage_ack.values()) else None,
                                 )
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s engine launch started",

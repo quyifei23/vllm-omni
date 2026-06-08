@@ -47,9 +47,6 @@ class SharedMemoryConnector(OmniConnectorBase):
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             # Always serialize first to check size (and for SHM writing)
-            # Note: For extremely large objects in "inline" mode (e.g. Ray),
-            # we might double-serialize if we're not careful, but here we assume
-            # if it's huge we use SHM, or if Ray, threshold is maxsize.
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -68,8 +65,6 @@ class SharedMemoryConnector(OmniConnectorBase):
                 self._metrics["shm_writes"] += 1
             else:
                 # Inline - pass bytes directly to avoid double serialization of the object
-                # We already serialized it to check size, so we pass the bytes.
-                # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
                 metadata = {"inline_bytes": payload, "size": size}
                 self._metrics["inline_writes"] += 1
 

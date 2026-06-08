@@ -20,7 +20,7 @@ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesPropose
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
-
+from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -321,103 +321,104 @@ class OmniGPUModelRunner(GPUModelRunner):
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
         # Add new requests to the cached states.
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            if req_id in self.requests:
-                self._update_streaming_input_additional_info(new_req_data, req_id)
-                req_state = self._update_streaming_request(req_id, new_req_data)
-                reqs_to_add.append(req_state)
-                continue
+        with nvtx_range("omni:add_new_request"):
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                req_id = new_req_data.req_id
+                if req_id in self.requests:
+                    self._update_streaming_input_additional_info(new_req_data, req_id)
+                    req_state = self._update_streaming_request(req_id, new_req_data)
+                    reqs_to_add.append(req_state)
+                    continue
 
-            # Since this is the first time the request has been scheduled,
-            # num_computed_tokens > 0 means that we have a hit in prefix
-            # caching; mark it so that we can manage the hidden states
-            # later on as needed.
-            if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
-                self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
+                # Since this is the first time the request has been scheduled,
+                # num_computed_tokens > 0 means that we have a hit in prefix
+                # caching; mark it so that we can manage the hidden states
+                # later on as needed.
+                if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
+                    self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
 
-            sampling_params = new_req_data.sampling_params
-            pooling_params = new_req_data.pooling_params
+                sampling_params = new_req_data.sampling_params
+                pooling_params = new_req_data.pooling_params
 
-            if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
+                if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+                    generator = torch.Generator(device=self.device)
+                    generator.manual_seed(sampling_params.seed)
+                else:
+                    generator = None
 
-            if self.is_pooling_model:
-                assert pooling_params is not None
-                task = pooling_params.task
-                assert task is not None, "You did not set `task` in the API"
+                if self.is_pooling_model:
+                    assert pooling_params is not None
+                    task = pooling_params.task
+                    assert task is not None, "You did not set `task` in the API"
 
-                model = cast(VllmModelForPooling, self.get_model())
-                to_update = model.pooler.get_pooling_updates(task)
-                to_update.apply(pooling_params)
+                    model = cast(VllmModelForPooling, self.get_model())
+                    to_update = model.pooler.get_pooling_updates(task)
+                    to_update.apply(pooling_params)
 
-            req_state = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                prompt_embeds=new_req_data.prompt_embeds,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=pooling_params,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-            )
-            self.requests[req_id] = req_state
-            if hasattr(self, "late_interaction_runner"):
-                self.late_interaction_runner.register_request(req_id, pooling_params)
-
-            # If prompt embeddings are provided, decode and attach to inter_data
-            try:
-                if getattr(new_req_data, "prompt_embeds", None) is not None:
-                    payload = new_req_data.prompt_embeds
-                    dtype = getattr(np, payload.dtype)
-                    arr = np.frombuffer(payload.data, dtype=dtype)
-                    arr = arr.reshape(payload.shape)
-                    pe_cpu = torch.from_numpy(arr)
-                    setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
-                    try:
-                        new_req_data.prompt_embeds = pe_cpu  # type: ignore[assignment]
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.error(f"Error decoding prompt embeds: {e}")
-            # Decode additional_information payloads (dictionary)
-            try:
-                if getattr(new_req_data, "additional_information", None) is not None:
-                    logger.warning_once(
-                        "additional_information on request data is deprecated, use model_intermediate_buffer"
-                    )
-                    info_dict = deserialize_additional_information(new_req_data.additional_information)
-                    if info_dict:
-                        self.model_intermediate_buffer[req_id] = info_dict
-                        setattr(
-                            self.requests[req_id],
-                            "additional_information_cpu",
-                            info_dict,
-                        )
-            except Exception as e:
-                logger.error(f"Error decoding additional information: {e}")
-
-            if sampling_params and sampling_params.prompt_logprobs is not None:
-                self.num_prompt_logprobs[req_id] = (
-                    self.input_batch.vocab_size
-                    if sampling_params.prompt_logprobs == -1
-                    else sampling_params.prompt_logprobs
+                req_state = CachedRequestState(
+                    req_id=req_id,
+                    prompt_token_ids=new_req_data.prompt_token_ids,
+                    prompt_embeds=new_req_data.prompt_embeds,
+                    mm_features=new_req_data.mm_features,
+                    sampling_params=sampling_params,
+                    pooling_params=pooling_params,
+                    generator=generator,
+                    block_ids=new_req_data.block_ids,
+                    num_computed_tokens=new_req_data.num_computed_tokens,
+                    output_token_ids=[],
+                    lora_request=new_req_data.lora_request,
                 )
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            if self.uses_mrope:
-                self._init_mrope_positions(req_state)
+                self.requests[req_id] = req_state
+                if hasattr(self, "late_interaction_runner"):
+                    self.late_interaction_runner.register_request(req_id, pooling_params)
 
-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            if self.uses_xdrope_dim > 0:
-                self._init_xdrope_positions(req_state)
+                # If prompt embeddings are provided, decode and attach to inter_data
+                try:
+                    if getattr(new_req_data, "prompt_embeds", None) is not None:
+                        payload = new_req_data.prompt_embeds
+                        dtype = getattr(np, payload.dtype)
+                        arr = np.frombuffer(payload.data, dtype=dtype)
+                        arr = arr.reshape(payload.shape)
+                        pe_cpu = torch.from_numpy(arr)
+                        setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
+                        try:
+                            new_req_data.prompt_embeds = pe_cpu  # type: ignore[assignment]
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"Error decoding prompt embeds: {e}")
+                # Decode additional_information payloads (dictionary)
+                try:
+                    if getattr(new_req_data, "additional_information", None) is not None:
+                        logger.warning_once(
+                            "additional_information on request data is deprecated, use model_intermediate_buffer"
+                        )
+                        info_dict = deserialize_additional_information(new_req_data.additional_information)
+                        if info_dict:
+                            self.model_intermediate_buffer[req_id] = info_dict
+                            setattr(
+                                self.requests[req_id],
+                                "additional_information_cpu",
+                                info_dict,
+                            )
+                except Exception as e:
+                    logger.error(f"Error decoding additional information: {e}")
 
-            reqs_to_add.append(self.requests[req_id])
+                if sampling_params and sampling_params.prompt_logprobs is not None:
+                    self.num_prompt_logprobs[req_id] = (
+                        self.input_batch.vocab_size
+                        if sampling_params.prompt_logprobs == -1
+                        else sampling_params.prompt_logprobs
+                    )
+                # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+                if self.uses_mrope:
+                    self._init_mrope_positions(req_state)
+
+                # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+                if self.uses_xdrope_dim > 0:
+                    self._init_xdrope_positions(req_state)
+
+                reqs_to_add.append(self.requests[req_id])
 
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
@@ -528,7 +529,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
-
+        
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
@@ -539,8 +540,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
-        # Refresh batch metadata with any pending updates.
-        self.input_batch.refresh_metadata()
+        
+        with nvtx_range("omni:refresh_metadata"):
+            # Refresh batch metadata with any pending updates.
+            self.input_batch.refresh_metadata()
 
         if deferred_spec_decode_corrections:
 

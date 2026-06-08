@@ -621,6 +621,12 @@ def run_headless(args: argparse.Namespace) -> None:
         stage_id=stage_id,
         async_chunk=False,
     )
+    # Override GPU transport mode from CLI when --gpu-tensor-transport
+    # is explicitly set (default "none" = no override).
+    gpu_transport = getattr(args, "gpu_tensor_transport", "none")
+    if gpu_transport != "none" and stage_connector_spec:
+        extra = stage_connector_spec.setdefault("extra", {})
+        extra["gpu_transport_mode"] = gpu_transport
 
     # Device assignment is managed externally (e.g. CUDA_VISIBLE_DEVICES);
     # runtime_cfg is intentionally ignored in headless mode.

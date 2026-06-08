@@ -419,6 +419,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
+                # In async_chunk mode, GPU tensors flow via connector (CUDA IPC),
+                # not through EngineCoreOutput msgpack serialization.
+                # Strip pooling_output to avoid serializing GPU tensors.
+                orchestrator_pooling = (
+                    pooler_output if self.chunk_transfer_adapter is None else None
+                )
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
@@ -426,7 +432,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=orchestrator_pooling,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),

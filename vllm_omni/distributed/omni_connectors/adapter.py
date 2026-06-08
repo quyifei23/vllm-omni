@@ -21,6 +21,7 @@ def try_send_via_connector(
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: OrchestratorAggregator,
+    gpu_transport: Any = None,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -55,6 +56,14 @@ def try_send_via_connector(
                 "timestamp": time.time(),
             },
         }
+
+        # Split GPU tensors before connector.put() so they don't hit serialization
+        if gpu_transport is not None:
+            from vllm_omni.distributed.gpu_transport.split import split_gpu_tensors, has_gpu_tensors
+
+            if has_gpu_tensors(payload_data):
+                payload_data = split_gpu_tensors(payload_data, gpu_transport)
+                logger.debug("[send] req=%s: split GPU tensors from payload", req_id)
 
         # Send data via connector
         success, serialized_size, metadata = connector.put(str(stage_id), str(next_stage_id), str(req_id), payload_data)
@@ -105,6 +114,7 @@ def try_recv_via_connector(
     task: dict[str, Any],
     connectors: dict[Any, Any],
     stage_id: int,
+    gpu_transports: dict[Any, Any] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """
     Attempts to resolve input data from either connector or IPC.
@@ -146,6 +156,17 @@ def try_recv_via_connector(
 
                 if payload_data and isinstance(payload_data, dict):
                     ein = payload_data.get("engine_inputs")
+
+                    # Reassemble GPU tensors if transport is available
+                    if gpu_transports:
+                        edge_key = (from_stage, to_stage)
+                        transport = gpu_transports.get(edge_key)
+                        if transport is not None:
+                            from vllm_omni.distributed.gpu_transport.split import reassemble_gpu_tensors
+
+                            ein = reassemble_gpu_tensors(ein, transport)
+                            logger.debug("[recv] req=%s edge=%s: reassembled GPU tensors", rid, edge_key)
+
                     decode_ms = (_t_end - _t_start) * 1000.0
 
                     rx_metrics = {"rx_decode_time_ms": decode_ms, "rx_transfer_bytes": serialized_size}

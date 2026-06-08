@@ -39,6 +39,31 @@ def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
     return val if isinstance(val, torch.Tensor) else None
 
 
+def _reconstruct_ipc_tensor(data: Any, dst_device: str) -> torch.Tensor | None:
+    """If *data* is a ``__gpux__`` IPC marker dict, rebuild the GPU tensor.
+
+    Returns the reconstructed GPU tensor, or None if *data* is not an IPC marker.
+    The tensor is a zero-copy view of the producer's GPU memory.
+    """
+    import pickle
+
+    if not isinstance(data, dict) or not data.get("__gpux__"):
+        return None
+    try:
+        from vllm_omni.distributed.gpu_transport.ipc_utils import rebuild_from_ipc_args
+
+        ipc_args = pickle.loads(data["ipc_args"])
+        with torch.cuda.device(dst_device):
+            return rebuild_from_ipc_args(ipc_args)
+    except Exception:
+        logger.warning(
+            "Failed to reconstruct GPU tensor from IPC args for id=%s",
+            data.get("tensor_id", "unknown"),
+            exc_info=True,
+        )
+        return None
+
+
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
     system_token_id = 8948
@@ -297,6 +322,20 @@ def thinker2talker_async_chunk(
     thinker_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed", {}), dict) else {}
     thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
     thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
+
+    # If the engine exported these via CUDA IPC, reconstruct GPU tensors
+    # on the talker GPU configured in the connector.
+    _conn = getattr(transfer_manager, 'connector', None)
+    _dst = getattr(_conn, 'dst_device', None) if _conn is not None else None
+    if _dst is None:
+        _dst = f"cuda:{getattr(_conn, '_dst_device', 0)}" if _conn is not None else "cuda:0"
+    if thinker_emb is None:
+        _raw = thinker_layers.get(int(_EMBED_LAYER_KEY)) or thinker_layers.get(_EMBED_LAYER_KEY)
+        thinker_emb = _reconstruct_ipc_tensor(_raw, dst_device=_dst)
+    if thinker_hid is None:
+        _raw = thinker_layers.get(int(_HIDDEN_LAYER_KEY)) or thinker_layers.get(_HIDDEN_LAYER_KEY)
+        thinker_hid = _reconstruct_ipc_tensor(_raw, dst_device=_dst)
+
     if thinker_emb is None or thinker_hid is None:
         logger.debug(
             "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
@@ -314,19 +353,19 @@ def thinker2talker_async_chunk(
         prompt_token_ids = _ensure_list(prompt_token_ids)
         payload: OmniPayload = {
             "embed": {
-                "prefill": thinker_emb.detach().cpu(),
+                "prefill": thinker_emb.detach(),
                 # Provide thinker-side TTS token embeddings for talker projection
-                "tts_bos": thinker_embed.get("tts_bos").detach().cpu()
+                "tts_bos": thinker_embed.get("tts_bos").detach()
                 if isinstance(thinker_embed.get("tts_bos"), torch.Tensor)
                 else None,
-                "tts_eos": thinker_embed.get("tts_eos").detach().cpu()
+                "tts_eos": thinker_embed.get("tts_eos").detach()
                 if isinstance(thinker_embed.get("tts_eos"), torch.Tensor)
                 else None,
-                "tts_pad": thinker_embed.get("tts_pad").detach().cpu()
+                "tts_pad": thinker_embed.get("tts_pad").detach()
                 if isinstance(thinker_embed.get("tts_pad"), torch.Tensor)
                 else None,
             },
-            "hidden_states": {"output": thinker_hid.detach().cpu()},
+            "hidden_states": {"output": thinker_hid.detach()},
             "ids": {"all": all_token_ids, "prompt": prompt_token_ids},
             "meta": {"finished": torch.tensor(is_finished, dtype=torch.bool)},
         }
@@ -343,19 +382,27 @@ def thinker2talker_async_chunk(
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            talker_additional_info["embed"]["prefill"] = torch.cat(
-                (
-                    save_payload.get("embed", {}).get("prefill"),
-                    talker_additional_info.get("embed", {}).get("prefill"),
-                ),
-                dim=0,
+            # Combine chunk-0 and chunk-1 tensors along dim 0 (seq_len).
+            # Guard against shape mismatches that can occur when the two
+            # chunks have different hidden dimensions (e.g. prefill vs
+            # decode projection heads).
+            def _safe_cat(saved: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+                if saved.shape[1:] != current.shape[1:]:
+                    logger.warning(
+                        "Chunk merge shape mismatch: saved%s current%s, "
+                        "using current chunk only",
+                        tuple(saved.shape), tuple(current.shape),
+                    )
+                    return current
+                return torch.cat((saved, current), dim=0)
+
+            talker_additional_info["embed"]["prefill"] = _safe_cat(
+                save_payload.get("embed", {}).get("prefill"),
+                talker_additional_info.get("embed", {}).get("prefill"),
             )
-            talker_additional_info["hidden_states"]["output"] = torch.cat(
-                (
-                    save_payload.get("hidden_states", {}).get("output"),
-                    talker_additional_info.get("hidden_states", {}).get("output"),
-                ),
-                dim=0,
+            talker_additional_info["hidden_states"]["output"] = _safe_cat(
+                save_payload.get("hidden_states", {}).get("output"),
+                talker_additional_info.get("hidden_states", {}).get("output"),
             )
     else:
         output_token_ids = request.output_token_ids
@@ -374,12 +421,12 @@ def thinker2talker_async_chunk(
 
         if output_token_ids:
             talker_additional_info["meta"]["override_keys"] = [("embed", "decode"), ("ids", "output")]
-            talker_additional_info["embed"] = {"decode": thinker_emb.detach().cpu()}
+            talker_additional_info["embed"] = {"decode": thinker_emb.detach()}
             talker_additional_info["ids"] = {"output": output_token_ids}
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["embed"] = {"prefill": thinker_emb.detach().cpu()}
-            talker_additional_info["hidden_states"] = {"output": thinker_hid.detach().cpu()}
+            talker_additional_info["embed"] = {"prefill": thinker_emb.detach()}
+            talker_additional_info["hidden_states"] = {"output": thinker_hid.detach()}
     return talker_additional_info
 
 

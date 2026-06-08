@@ -14,6 +14,66 @@
 async_chunk: true
 
 connectors:
+  # ============================================================
+  # UniIPCConnector 实验配置（input_connectors 引用其中一个）
+  # ============================================================
+
+  # 实验 1：基线（当前行为，复现生产者端 OOM）
+  # uniipc_baseline:
+  #   name: UniIPCConnector
+  #   extra:
+  #     gpu_transport_mode: cuda_ipc
+  #     src_device: 3
+  #     dst_device: 7
+
+  # 实验 2：SHM 稳定性基线（全部 inline，验证 GPU OOM 是否消失）
+  # uniipc_none:
+  #   name: UniIPCConnector
+  #   extra:
+  #     gpu_transport_mode: cuda_ipc
+  #     src_device: 3
+  #     dst_device: 7
+
+  # 实验 3：CUDA Copy（验证消费端 OOM）
+  # uniipc_copy:
+  #   name: UniIPCConnector
+  #   extra:
+  #     gpu_transport_mode: cuda_ipc
+  #     src_device: 3
+  #     dst_device: 7
+
+  # 实验 4：大小阈值优化（< 64KB 的张量走 inline）
+  # uniipc_size_threshold:
+  #   name: UniIPCConnector
+  #   extra:
+  #     gpu_transport_mode: cuda_ipc
+  #     src_device: 3
+  #     dst_device: 7
+  #     gpu_transport_min_bytes: 0
+
+  # 实验 5：显存压力降级（空闲 < 85% 时降级 inline）
+  # uniipc_pressure:
+  #   name: UniIPCConnector
+  #   extra:
+  #     gpu_transport_mode: cuda_ipc
+  #     src_device: 3
+  #     dst_device: 7
+  #     gpu_memory_pressure_threshold: 0.85
+
+  # 实验 6：预期最优组合（大小阈值 + 压力降级）
+  uniipc_thinker_to_talker:
+    name: UniIPCConnector
+    extra:
+      gpu_transport_mode: cuda_ipc
+      src_device: 0
+      dst_device: 4
+      gpu_transport_min_bytes: 0
+      release_timeout_ms: 0
+      # gpu_memory_pressure_threshold: 0.85
+
+  # ============================================================
+  # SharedMemoryConnector（stage 1->2）
+  # ============================================================
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
@@ -24,7 +84,7 @@ stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.88
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "0,1,2,3"
@@ -40,12 +100,12 @@ stages:
   - stage_id: 1
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.3
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "4"
     input_connectors:
-      from_stage_0: connector_of_shared_memory
+      from_stage_0: uniipc_thinker_to_talker
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -56,12 +116,12 @@ stages:
   - stage_id: 2
     max_num_batched_tokens: 51200
     max_num_seqs: 64
-    gpu_memory_utilization: 0.1
+    gpu_memory_utilization: 0.5
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false
-    devices: "5"
+    devices: "4"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -94,12 +154,12 @@ platforms:
         tensor_parallel_size: 4
         enforce_eager: true
         max_cudagraph_capture_size: 0
-        devices: "0,1,2,3"
+        devices: "3,4,5,6"
       - stage_id: 1
         enforce_eager: true
         max_cudagraph_capture_size: 0
-        devices: "4"
+        devices: "7"
       - stage_id: 2
         gpu_memory_utilization: 0.3
         max_cudagraph_capture_size: 0
-        devices: "4"
+        devices: "7"

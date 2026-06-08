@@ -43,11 +43,24 @@ class OmniConnectorFactory:
         constructor = cls._registry[spec.name]
         try:
             connector = constructor(spec.extra)
-            logger.info(f"Created connector: {spec.name}")
-            return connector
         except Exception as e:
             logger.error(f"Failed to create connector {spec.name}: {e}")
             raise ValueError(f"Failed to create connector {spec.name}: {e}")
+        # Wire ACK pipes passed through process spawn kwargs.
+        extra = getattr(spec, "extra", {}) or {}
+        stage_id = int(extra.get("stage_id", -1))
+        if stage_id >= 0 and hasattr(connector, "set_ack_conns"):
+            try:
+                from vllm_omni.engine.stage_engine_core_proc import _WORKER_ACK_PIPES
+                pipes = _WORKER_ACK_PIPES.get(stage_id, {})
+                ack_conn = pipes.get("ack_conn")
+                consumer_ack_conn = pipes.get("consumer_ack_conn")
+                if ack_conn or consumer_ack_conn:
+                    connector.set_ack_conns(ack_conn, consumer_ack_conn)
+            except Exception:
+                pass
+        logger.info(f"Created connector: {spec.name}")
+        return connector
 
     @classmethod
     def list_registered_connectors(cls) -> list[str]:
@@ -80,6 +93,11 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return SharedMemoryConnector(config)
 
 
+def _create_uniipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    from .connectors.uniipc_connector import UniIPCConnector
+    return UniIPCConnector(config)
+
+
 def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
         from .connectors.yuanrong_connector import YuanrongConnector
@@ -102,10 +120,22 @@ def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
     return MooncakeTransferEngineConnector(config)
 
 
+def _create_uniipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.uniipc_connector import UniIPCConnector
+    except ImportError:
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.uniipc_connector import UniIPCConnector
+    return UniIPCConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+OmniConnectorFactory.register_connector("UniIPCConnector", _create_uniipc_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 # Backward-compatible aliases – will be removed in the future
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_store_connector)

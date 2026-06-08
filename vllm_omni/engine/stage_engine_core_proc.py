@@ -53,9 +53,16 @@ class StageEngineCoreProc(EngineCoreProc):
         *args: Any,
         dp_rank: int = 0,
         local_dp_rank: int = 0,
+        ack_pipes: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process."""
+        # Save ACK pipes into module-level dict so the connector factory
+        # can wire them after connector creation.
+        if ack_pipes:
+            stage_id = int(ack_pipes.get("stage_id", -1))
+            if stage_id >= 0:
+                _WORKER_ACK_PIPES[stage_id] = ack_pipes
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
@@ -115,10 +122,16 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core.shutdown()
 
 
+# Worker-side ACK pipes storage.  Populated by run_stage_core from the
+# kwargs passed through spawn_stage_core so they survive process spawn.
+_WORKER_ACK_PIPES: dict[int, dict[str, Any]] = {}
+
+
 def spawn_stage_core(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool = False,
+    ack_pipes: dict[str, Any] | None = None,
 ) -> tuple[EngineZmqAddresses, BaseProcess, str]:
     """Spawn a *StageEngineCoreProc* subprocess without performing the handshake.
 
@@ -142,6 +155,7 @@ def spawn_stage_core(
             "log_stats": log_stats,
             "dp_rank": 0,
             "local_dp_rank": 0,
+            "ack_pipes": ack_pipes or {},
         },
     )
     proc.start()

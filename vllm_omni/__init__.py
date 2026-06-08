@@ -25,12 +25,24 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         raise
     # Allow importing vllm_omni without vllm (e.g., documentation builds)
     patch = None  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    # vllm import failed due to an incompatible dependency (e.g., transformers
+    # version mismatch).  The transport sub-modules that do not depend on vllm
+    # can still be imported.
+    patch = None  # type: ignore
 
 # Register custom configs (AutoConfig, AutoTokenizer) as early as possible.
-from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
-from vllm_omni.transformers_utils import parsers as _parsers  # noqa: F401, E402
+try:
+    from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
+    from vllm_omni.transformers_utils import parsers as _parsers  # noqa: F401, E402
+except ImportError:  # pragma: no cover - optional dependency
+    _configs = None  # type: ignore
+    _parsers = None  # type: ignore
 
-from .config import OmniModelConfig
+try:
+    from .config import OmniModelConfig
+except ImportError:  # pragma: no cover - optional dependency
+    OmniModelConfig = None  # type: ignore
 
 
 def __getattr__(name: str):

@@ -11,11 +11,12 @@ async_chunk: false
 stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
-    max_num_seqs: 3
-    gpu_memory_utilization: 0.45
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.85
     trust_remote_code: true
     enable_prefix_caching: false
-    devices: "0"
+    devices: "0,1"
+    tensor_parallel_size: 2
     default_sampling_params:
       temperature: 0.4
       top_p: 0.9
@@ -27,11 +28,12 @@ stages:
 
   - stage_id: 1
     max_num_batched_tokens: 32768
-    max_num_seqs: 1
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.85
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
-    devices: "0"
+    devices: "2"
     input_connectors:
       from_stage_0: shared_memory_connector
     default_sampling_params:

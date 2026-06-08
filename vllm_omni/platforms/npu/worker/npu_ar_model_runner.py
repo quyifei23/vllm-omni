@@ -877,7 +877,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
+                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().cpu().contiguous()
             else:
                 req_hidden_states_cpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -900,8 +900,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
                 )
+                mm_gpu = {}
             else:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
+                multimodal_flat = flatten_payload(multimodal_outputs)
+                mm_gpu = {
+                    k: v for k, v in multimodal_flat.items()
+                    if k.startswith("hidden_states.")
+                }
+                mm_other = {
+                    k: v for k, v in multimodal_flat.items()
+                    if not k.startswith("hidden_states.")
+                }
+                mm_cpu = build_mm_cpu(mm_other)
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -919,7 +929,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
+                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().cpu().contiguous()
 
             pooler_output = []
             for rid in req_ids_output_copy:
@@ -960,6 +970,18 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                 pass_lists_through=False,
                                 seq_len=seq_len,
                             )
+                    payload.update(mm_payload)
+
+                if mm_gpu:
+                    for mm_key, mm_val in mm_gpu.items():
+                        mm_payload[mm_key] = to_payload_element(
+                            element=mm_val,
+                            idx=idx,
+                            start=start,
+                            end=end,
+                            pass_lists_through=False,
+                            seq_len=seq_len,
+                        )
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 

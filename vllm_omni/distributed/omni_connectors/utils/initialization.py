@@ -35,18 +35,20 @@ def initialize_connectors_from_config(
     purpose: str = "request_forwarding",
     caller_stage_id: int | str | None = None,
     is_sender: bool | None = None,
-) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
+) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase], dict[tuple[str, str], Any], dict[tuple[str, str], Any]]:
     """
     Initialize connectors from configuration file.
 
     Returns:
-        tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
+        tuple: (OmniTransferConfig, dict of {(from, to): connector_instance},
+                dict of {(from, to): gpu_transport_instance},
+                dict of {(from, to): consumer_ack_conn})
     """
     transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
 
     if not transfer_config:
         logger.info("No OmniTransferConfig provided")
-        return None, {}
+        return None, {}, {}, {}
 
     # create connectors from config
     connectors = create_connectors_from_config(
@@ -55,7 +57,40 @@ def initialize_connectors_from_config(
         caller_stage_id=caller_stage_id,
         is_sender=is_sender,
     )
-    return transfer_config, connectors
+
+    # create GPU transports if configured
+    transports: dict[tuple[str, str], Any] = {}
+    consumer_ack_conns: dict[tuple[str, str], Any] = {}
+    if transfer_config and transfer_config.gpu_transport_config is not None:
+        from vllm_omni.distributed.gpu_transport import create_transport
+        from vllm_omni.distributed.gpu_transport.control_channel import ControlChannelPair
+        from vllm_omni.distributed.gpu_transport.config import GPUTransportConfig
+
+        gt_config = transfer_config.gpu_transport_config
+        if isinstance(gt_config, dict):
+            gt_config = GPUTransportConfig(**gt_config)
+
+        for edge in transfer_config.connectors:
+            chan = ControlChannelPair()
+            # Copy config without ack_conn (wired manually below)
+            transport_config = GPUTransportConfig(
+                mode=gt_config.mode,
+                src_device=getattr(gt_config, 'src_device', 0),
+                dst_device=getattr(gt_config, 'dst_device', 1),
+                release_timeout_ms=getattr(gt_config, 'release_timeout_ms', 10000.0),
+            )
+            transport = create_transport(transport_config)
+            if transport is None:
+                logger.info("Skipping GPU transport for edge %s (mode=none)", edge)
+                continue
+            # Wire ACK: producer gets producer_conn, consumer gets consumer_conn
+            transport._ack_conn = chan.producer_conn
+            transport._start_ack_thread() if hasattr(transport, '_start_ack_thread') else None
+            transports[edge] = transport
+            consumer_ack_conns[edge] = chan.consumer_conn
+            logger.info("Created %s transport + ACK channel for edge %s", gt_config.mode, edge)
+
+    return transfer_config, connectors, transports, consumer_ack_conns
 
 
 def create_connectors_from_config(
@@ -357,26 +392,27 @@ def load_omni_transfer_config(
 
 def initialize_orchestrator_connectors(
     config_path: str | None, worker_backend: str | None = "multi_process", shm_threshold_bytes: int = 65536
-) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
+) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase], dict[tuple[str, str], Any], dict[tuple[str, str], Any]]:
     """Initialize connectors shared at orchestrator level.
     Args:
         config_path: The path to the configuration file.
         worker_backend: The backend to use for the worker.
     Returns:
-        A tuple containing the OmniTransferConfig and a dictionary of connectors.
+        A tuple containing the OmniTransferConfig, a dictionary of connectors,
+        a dictionary of GPU transports, and a dictionary of consumer ACK connections.
     """
     if worker_backend == "ray":
         default_shm_threshold = sys.maxsize
     else:
         default_shm_threshold = max(0, shm_threshold_bytes)
-    transfer_config, connectors = initialize_connectors_from_config(
+    transfer_config, connectors, transports, consumer_ack_conns = initialize_connectors_from_config(
         config_path,
         default_shm_threshold=default_shm_threshold,
         purpose="request_forwarding",
         caller_stage_id="orchestrator",
         is_sender=True,
     )
-    return transfer_config, connectors
+    return transfer_config, connectors, transports, consumer_ack_conns
 
 
 def get_stage_connector_config(

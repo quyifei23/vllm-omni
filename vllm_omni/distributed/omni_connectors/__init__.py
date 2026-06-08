@@ -4,6 +4,7 @@
 from .connectors.base import OmniConnectorBase
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
+from .connectors.uniipc_connector import UniIPCConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 
 try:
@@ -38,6 +39,7 @@ __all__ = [
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",
     "SharedMemoryConnector",
+    "UniIPCConnector",
     "YuanrongConnector",
     # Utilities
     "load_omni_transfer_config",

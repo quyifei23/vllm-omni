@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.utils.nvtx import nvtx_mark, nvtx_range
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
@@ -79,6 +80,23 @@ class OmniConnectorModelRunnerMixin:
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
         self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
+        # Outbound connector always uses SharedMemoryConnector so that
+        # downstream stages that are not configured with UniIPC receive
+        # plain serialized payloads instead of __gpux__ markers.
+        if self._omni_connector is not None:
+            try:
+                from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
+                    SharedMemoryConnector,
+                )
+                self._omni_send_connector: OmniConnectorBase | None = (
+                    SharedMemoryConnector({
+                        "stage_id": self._omni_connector.stage_id,
+                    })
+                )
+            except Exception:
+                self._omni_send_connector = None
+        else:
+            self._omni_send_connector = None
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -201,6 +219,11 @@ class OmniConnectorModelRunnerMixin:
                 self._omni_connector.close()
             except Exception:
                 pass
+        if getattr(self, "_omni_send_connector", None) is not None:
+            try:
+                self._omni_send_connector.close()
+            except Exception:
+                pass
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.
@@ -224,22 +247,54 @@ class OmniConnectorModelRunnerMixin:
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
             self._kv_triggered_requests.discard(req_id)
+        # ACK GPU IPC tensors to release producer-side TensorRegistry entries
+        if self._omni_connector is not None:
+            self._omni_connector.release_gpu_tensors(send_req_id)
         self._cleanup_recv_delivery_state(req_id)
 
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
         ext_id = self._request_ids_mapping.pop(req_id, None)
+        drop_key = ext_id if ext_id is not None else req_id
         if hasattr(self, "_lock"):
             with self._lock:
                 self._drop_send_side_payload_state(req_id, ext_id)
         else:
             self._drop_send_side_payload_state(req_id, ext_id)
+        # ACK GPU IPC tensors to release producer-side TensorRegistry entries
+        if self._omni_connector is not None:
+            self._omni_connector.release_gpu_tensors(drop_key)
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
         self._send_side_request_payload.pop(req_id, None)
+
+    def _cleanup_gpu_transport_timeouts(self) -> None:
+        """Release GPU transport tensors whose ACK never arrived.
+
+        Called periodically from the recv loop to protect producer-side
+        registries when a consumer exits or a release ACK is lost.
+        Only meaningful when ``release_timeout_ms > 0`` on the transport.
+        """
+        conn = self._omni_connector
+        if conn is None:
+            return
+        transport = getattr(conn, "_transport", None)
+        if transport is not None and hasattr(transport, "cleanup_timeouts"):
+            try:
+                released = transport.cleanup_timeouts()
+                if released:
+                    logger.warning(
+                        "[Stage-%s] GPU transport timeout cleanup: released %d tensors: %s",
+                        self._stage_id, len(released), released,
+                    )
+            except Exception:
+                logger.debug(
+                    "[Stage-%s] GPU transport timeout cleanup failed",
+                    self._stage_id, exc_info=True,
+                )
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
@@ -519,14 +574,36 @@ class OmniConnectorModelRunnerMixin:
             return dict(payload)
         return payload
 
-    def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
-        """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""
-        tp_group = self._get_local_tp_group()
-        if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return packet
-        leader_packet = packet if self.is_data_transfer_rank() else None
-        return tp_group.broadcast_object(leader_packet, src=0)
+    # def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
+    #     """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""
+    #     tp_group = self._get_local_tp_group()
+    #     if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
+    #         return packet
+    #     leader_packet = packet if self.is_data_transfer_rank() else None
+    #     return tp_group.broadcast_object(leader_packet, src=0)
 
+    def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
+        """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""                                                                                                  
+        tp_group = self._get_local_tp_group()                                                                                                                         
+        if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:                                                                                               
+            return packet                                                                                                                                             
+        leader_packet = packet if self.is_data_transfer_rank() else None                                                                                              
+        import time                                                                                                                                                   
+        t0 = time.time()                                                                                                                                              
+        result = tp_group.broadcast_object(leader_packet, src=0)                                                                                                      
+        elapsed = (time.time() - t0) * 1000                                                                                                                           
+        if self.is_data_transfer_rank():                                                                                                                              
+            logger.warning(                                                                                                                                           
+                "[Stage-%s] TP BCAST broadcast_object writer elapsed_ms=%.1f",                                                                                        
+                self._stage_id, elapsed,                                                                                                                              
+            )                                                                                                                                                         
+        else:                                                                                                                                                         
+            logger.warning(                                                                                                                                           
+                "[Stage-%s] TP BCAST broadcast_object reader elapsed_ms=%.1f",                                                                                        
+                self._stage_id, elapsed,                                                                                                                              
+            )                                                                                                                                                         
+        return result
+    
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
@@ -972,13 +1049,14 @@ class OmniConnectorModelRunnerMixin:
         """
         if self._kv_transfer_manager is None:
             return list(finished_reqs.keys()) if finished_reqs else []
-        result = self._kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
-            kv_caches=kv_caches,
-            block_size=block_size,
-            cache_dtype=cache_dtype,
-            request_id_resolver=request_id_resolver,
-        )
+        with nvtx_range("omni:send_kv_cache"):
+            result = self._kv_transfer_manager.handle_finished_requests_kv_transfer(
+                finished_reqs=finished_reqs,
+                kv_caches=kv_caches,
+                block_size=block_size,
+                cache_dtype=cache_dtype,
+                request_id_resolver=request_id_resolver,
+            )
         if result:
             self._kv_sent_req_ids.extend(result)
         return result
@@ -994,10 +1072,11 @@ class OmniConnectorModelRunnerMixin:
         """
         if self._kv_transfer_manager is None:
             return None, 0
-        return self._kv_transfer_manager.receive_kv_cache_for_request(
-            request_id=request_id,
-            target_device=target_device,
-        )
+        with nvtx_range("omni:recv_kv_cache"):
+            return self._kv_transfer_manager.receive_kv_cache_for_request(
+                request_id=request_id,
+                target_device=target_device,
+            )
 
     def receive_cfg_companion_kv_payloads(
         self,
@@ -1318,6 +1397,15 @@ class OmniConnectorModelRunnerMixin:
                     fanout_packet = self._collect_async_chunk_fanout_packet_locked()
             else:
                 fanout_packet = None
+
+            if self.is_data_transfer_rank():
+                if fanout_packet is not None:
+                    staged_keys = len(fanout_packet.get("staged_payloads", ()))
+                    meta_keys = len(fanout_packet.get("request_metadata", ()))
+                    logger.warning(
+                        "[Stage-%s] TP BCAST fanout_packet staged_payloads=%d request_metadata=%d",
+                        self._stage_id, staged_keys, meta_keys,
+                    )
             fanout_packet = self._broadcast_tp_payload_packet(fanout_packet)
             if fanout_packet is None:
                 newly_finished = set()
@@ -1446,13 +1534,17 @@ class OmniConnectorModelRunnerMixin:
                     pending_ids[:5],
                     _recv_poll_count,
                 )
+                # Periodic GPU transport timeout cleanup: release tensors
+                # whose ACK never arrived (e.g. consumer process exited).
+                self._cleanup_gpu_transport_timeouts()
 
             made_progress = False
             for req_id in pending_ids:
                 if self._stop_event.is_set():
                     break
                 try:
-                    made_progress = self._poll_single_request(req_id) or made_progress
+                    with nvtx_range("omni:recv_loop"):
+                        made_progress = self._poll_single_request(req_id) or made_progress
                 except Exception:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
@@ -1479,7 +1571,8 @@ class OmniConnectorModelRunnerMixin:
             if task is not None:
                 success = False
                 try:
-                    success = self._send_single_request(task)
+                    with nvtx_range("omni:save_loop"):
+                        success = self._send_single_request(task)
                 except Exception:
                     logger.error(
                         "Error saving data for %s",
@@ -1487,7 +1580,8 @@ class OmniConnectorModelRunnerMixin:
                         exc_info=True,
                     )
                 if not success:
-                    self._requeue_or_drop_failed_send(task)
+                    with nvtx_range("omni:save_requeue"):
+                        self._requeue_or_drop_failed_send(task)
                 continue
 
             self._work_available.wait(timeout=0.01)
@@ -1736,7 +1830,10 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._omni_connector
+        # Use the outbound (SHM-only) connector so downstream stages that
+        # do not use UniIPC receive plain serialized payloads, not __gpux__
+        # markers that they cannot reassemble.
+        connector = getattr(self, "_omni_send_connector", None) or self._omni_connector
         if connector is None:
             return True
 
@@ -1956,9 +2053,11 @@ class OmniConnectorModelRunnerMixin:
 
         spec = ConnectorSpec(name=name, extra=extra)
         try:
-            return OmniConnectorFactory.create_connector(spec)
+            connector = OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
             raise RuntimeError(f"Failed to create connector {name}") from exc
+        # ACK pipes are wired centrally in OmniConnectorFactory.
+        return connector
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:

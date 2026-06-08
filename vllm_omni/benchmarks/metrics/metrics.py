@@ -25,6 +25,17 @@ class MultiModalsBenchmarkMetrics(BenchmarkMetrics):
     median_audio_duration_s: float = 0.0
     std_audio_duration_s: float = 0.0
     percentiles_audio_duration_s: list[tuple[float, float]] = None
+    # Pipeline metrics
+    mean_audio_e2el_ms: float = 0.0
+    median_audio_e2el_ms: float = 0.0
+    std_audio_e2el_ms: float = 0.0
+    mean_audio_itl_ms: float = 0.0
+    median_audio_itl_ms: float = 0.0
+    std_audio_itl_ms: float = 0.0
+    mean_audio_text_gap_ms: float = 0.0
+    median_audio_text_gap_ms: float = 0.0
+    std_audio_text_gap_ms: float = 0.0
+    mean_pipeline_ratio: float = 0.0
 
 
 def print_metrics(
@@ -54,6 +65,7 @@ def print_metrics(
     print_text_metrics(task_type, selected_percentile_metrics, metrics)
     if task_type == TaskType.GENERATION:
         print_audio_metrics(selected_percentile_metrics, metrics)
+        print_omni_pipeline_metrics(metrics)
     print("=" * 50)
 
 
@@ -83,6 +95,19 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     for metric in selected_percentile_metrics:
         if metric.startswith("audio"):
             process_one_metric(metric, metrics)
+
+
+def print_omni_pipeline_metrics(metrics: MultiModalsBenchmarkMetrics):
+    print("{s:{c}^{n}}".format(s=" Omni Pipeline Metrics ", n=50, c="="))
+    print("{:<40} {:<10.2f}".format("Mean TTFA (ms):", metrics.mean_audio_ttfp_ms))
+    print("{:<40} {:<10.2f}".format("Median TTFA (ms):", metrics.median_audio_ttfp_ms))
+    print("{:<40} {:<10.2f}".format("Mean Text-Audio Gap (ms):", metrics.mean_audio_text_gap_ms))
+    print("{:<40} {:<10.2f}".format("Median Text-Audio Gap (ms):", metrics.median_audio_text_gap_ms))
+    print("{:<40} {:<10.2f}".format("Mean Audio E2EL (ms):", metrics.mean_audio_e2el_ms))
+    print("{:<40} {:<10.2f}".format("Median Audio E2EL (ms):", metrics.median_audio_e2el_ms))
+    print("{:<40} {:<10.2f}".format("Mean Audio ITL (ms):", metrics.mean_audio_itl_ms))
+    print("{:<40} {:<10.2f}".format("Median Audio ITL (ms):", metrics.median_audio_itl_ms))
+    print("{:<40} {:<10.2f}".format("Mean Pipeline Ratio (TTFT/TTFA):", metrics.mean_pipeline_ratio))
 
 
 def process_one_metric(
@@ -167,6 +192,9 @@ def calculate_metrics(
     e2els: list[float] = []
     audio_ttfps: list[float] = []
     audio_rtfs: list[float] = []
+    audio_e2els: list[float] = []
+    audio_itls_flat: list[float] = []
+    audio_text_gaps: list[float] = []
     audio_duration: list[float] = []
     audio_frames: list[int] = []
     input_audio_duration = 0.0
@@ -203,6 +231,9 @@ def calculate_metrics(
             audio_duration.append(getattr(outputs[i], "audio_duration", 0.0))
             audio_frames.append(getattr(outputs[i], "audio_frames", 0.0))
             e2els.append(outputs[i].latency)
+            audio_e2els.append(getattr(outputs[i], "audio_e2el", 0.0))
+            audio_itls_flat += getattr(outputs[i], "audio_itl", []) or []
+            audio_text_gaps.append(getattr(outputs[i], "audio_text_gap", 0.0))
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
         else:
@@ -329,6 +360,16 @@ def calculate_metrics(
         std_audio_rtf=np.std(audio_rtfs or 0),
         median_audio_rtf=np.median(audio_rtfs or 0),
         percentiles_audio_rtf=[(p, np.percentile(audio_rtfs or 0, p)) for p in selected_percentiles],
+        mean_audio_e2el_ms=np.mean(audio_e2els or 0) * 1000,
+        median_audio_e2el_ms=np.median(audio_e2els or 0) * 1000,
+        std_audio_e2el_ms=np.std(audio_e2els or 0) * 1000,
+        mean_audio_itl_ms=np.mean(audio_itls_flat or 0) * 1000,
+        median_audio_itl_ms=np.median(audio_itls_flat or 0) * 1000,
+        std_audio_itl_ms=np.std(audio_itls_flat or 0) * 1000,
+        mean_audio_text_gap_ms=np.mean(audio_text_gaps or 0) * 1000,
+        median_audio_text_gap_ms=np.median(audio_text_gaps or 0) * 1000,
+        std_audio_text_gap_ms=np.std(audio_text_gaps or 0) * 1000,
+        mean_pipeline_ratio=np.mean([g/t if t > 0 else 0 for g, t in zip(ttfts, audio_ttfps)]) if ttfts and audio_ttfps else 0.0,
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,

@@ -29,6 +29,7 @@ class OmniTransferConfig:
     # Direct mapping: (from_stage, to_stage) -> connector
     connectors: dict[tuple[str, str], ConnectorSpec] = field(default_factory=dict)
     default_connector: ConnectorSpec | None = None
+    gpu_transport_config: Any = None  # GPUTransportConfig | None
 
     def get_connector_for_edge(self, from_stage: str, to_stage: str) -> ConnectorSpec | None:
         """Get connector spec for a specific edge."""

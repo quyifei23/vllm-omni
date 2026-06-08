@@ -145,6 +145,7 @@ class OmniEngineArgs(EngineArgs):
     worker_cls: str = None
     enable_sleep_mode: bool = False
     omni: bool = False
+    gpu_tensor_transport: str = "none"  # "none" | "cuda_ipc" | "cuda_copy"
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -155,6 +156,19 @@ class OmniEngineArgs(EngineArgs):
         try:
             parser.add_argument(
                 "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
+            )
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--gpu-tensor-transport",
+                type=str,
+                default="none",
+                choices=["none", "cuda_ipc", "cuda_copy"],
+                help="GPU tensor transport mode for inter-stage GPU tensor transfer. "
+                "'none': use existing serialization path (default). "
+                "'cuda_ipc': zero-copy via CUDA IPC. "
+                "'cuda_copy': eager P2P copy via CUDA IPC.",
             )
         except argparse.ArgumentError:
             pass

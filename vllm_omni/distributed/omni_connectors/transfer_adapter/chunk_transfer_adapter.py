@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from typing import Any
 
@@ -77,7 +78,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             name=connector_config.get("name", "SharedMemoryConnector"),
             extra=connector_config.get("extra", {}),
         )
-        return OmniConnectorFactory.create_connector(connector_specs)
+        connector = OmniConnectorFactory.create_connector(connector_specs)
+        # Wire ACK pipes — handled centrally in OmniConnectorFactory.
+        return connector
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -135,11 +138,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
+            t0 = time.perf_counter()
             result = self.connector.get(
                 str(target_stage_id),
                 str(stage_id),
                 connector_get_key,
             )
+            get_ms = (time.perf_counter() - t0) * 1000.0
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             return False
@@ -188,7 +193,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            logger.debug(
+                "get stage=%s->%s req=%s chunk=%s size=%d get_ms=%.2f",
+                target_stage_id, stage_id, external_req_id, chunk_id, size, get_ms,
+            )
             return True
 
         return False
@@ -241,23 +249,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request=request,
                     is_finished=is_finished,
                 )
-
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
             return
 
+        t0 = time.perf_counter()
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+        put_ms = (time.perf_counter() - t0) * 1000.0
 
         if success:
             self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            logger.debug(
+                "put stage=%s->%s req=%s chunk=%s size=%d put_ms=%.2f",
+                stage_id, next_stage_id, external_req_id, chunk_id, size, put_ms,
+            )
             finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):
@@ -289,6 +301,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        # Look up the external request ID before popping the mapping.
+        # The connector's tensor tracking uses external IDs in put_key.
+        external_req_id = self.request_ids_mapping.get(request_id, request_id)
+
         self.finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
@@ -297,6 +313,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
+
+        # Release GPU transport tensors now that the consumer (talker)
+        # is truly done processing this request's data.
+        if hasattr(self.connector, "release_gpu_tensors"):
+            self.connector.release_gpu_tensors(external_req_id)
 
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
@@ -313,6 +334,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
 
     def cleanup(
         self,

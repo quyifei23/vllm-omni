@@ -24,6 +24,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
 from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.utils.nvtx import nvtx_range, nvtx_mark
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput
@@ -266,6 +267,7 @@ class StageEngineCoreClientBase:
             self.replica_id,
             request.request_id,
         )
+        nvtx_mark("stage_client:add_request")
         await super().add_request_async(request)
 
     # ==================== Stage Methods ====================
@@ -401,6 +403,7 @@ class StageEngineCoreClientBase:
         Transition planning is expressed in terms of the upstream outputs
         and the original prompt.
         """
+        nvtx_mark("stage_client:process_engine_inputs")
         if self.custom_process_input_func is not None:
             signature = inspect.signature(self.custom_process_input_func)
             if len(signature.parameters) >= 4:
